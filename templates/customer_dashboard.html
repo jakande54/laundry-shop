@@ -17,6 +17,7 @@
         --green: #059669;
         --orange: #d97706;
         --red: #dc2626;
+        --purple: #6d28d9;
         --white: #ffffff;
         --surface: #f9fafb;
         --border: #e5e7eb;
@@ -218,6 +219,11 @@
         color: var(--blue-dark);
       }
 
+      .badge-cod {
+        background: #ede9fe;
+        color: var(--purple);
+      }
+
       .status-cell {
         display: flex;
         align-items: center;
@@ -297,6 +303,33 @@
         justify-content: flex-end;
         gap: 10px;
         margin-top: 1rem;
+      }
+
+      /* Order summary (kg + amount), read-only */
+      .order-summary {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 1rem;
+        margin-bottom: 1.25rem;
+      }
+
+      .summary-box {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 1rem;
+        text-align: center;
+      }
+
+      .summary-label {
+        font-size: 0.8rem;
+        color: var(--muted);
+        margin-bottom: 0.35rem;
+      }
+
+      .summary-value {
+        font-size: 1.4rem;
+        font-weight: 700;
       }
 
       /* Payment option cards */
@@ -422,7 +455,8 @@
           grid-template-columns: 1fr;
         }
 
-        .pay-options {
+        .pay-options,
+        .order-summary {
           grid-template-columns: 1fr;
         }
       }
@@ -505,6 +539,8 @@
                   <div class="status-cell">
                     {% if o.payment_status == 'paid' %}
                     <span class="badge badge-paid">Paid</span>
+                    {% elif o.payment_status == 'cod' %}
+                    <span class="badge badge-cod">Pay on delivery</span>
                     {% else %}
                     <span
                       class="badge {% if o.status == 'Completed' %}badge-completed{% else %}badge-pending{% endif %}"
@@ -514,7 +550,7 @@
                     {% if o.status == 'Completed' %}
                     <button
                       class="btn btn-sm btn-pay"
-                      onclick="openPaymentModal({{ o.id }}, '{{ o.customer }}', '{{ o.phone }}')"
+                      onclick="openPaymentModal({{ o.id }}, '{{ o.customer }}', '{{ o.phone }}', {{ o.kg or 0 }}, {{ o.amount or 0 }})"
                     >
                       Pay
                     </button>
@@ -582,9 +618,18 @@
         </h2>
         <div class="modal-subtitle" id="payOrderSubtitle"></div>
 
-        <div class="form-group">
-          <label>Amount (KES)</label>
-          <input id="payAmount" type="number" min="1" placeholder="e.g. 800" />
+        <!-- No amount input here on purpose — the weight and price were
+             set by staff when the order was marked done. The customer just
+             sees what's owed and picks how to pay. -->
+        <div class="order-summary">
+          <div class="summary-box">
+            <div class="summary-label">Total weight</div>
+            <div class="summary-value" id="payWeight">– kg</div>
+          </div>
+          <div class="summary-box">
+            <div class="summary-label">Amount due</div>
+            <div class="summary-value" id="payAmount">KES –</div>
+          </div>
         </div>
 
         <div class="pay-options">
@@ -627,7 +672,7 @@
 
     <script>
       const socket = io();
-      let currentPaymentOrder = null; // { id, customer, phone }
+      let currentPaymentOrder = null; // { id, customer, phone, kg, amount }
 
       function showToast(msg, ok = true) {
         const t = document.getElementById("toast");
@@ -641,7 +686,6 @@
         document.getElementById("orderModal").classList.remove("open");
       }
 
-      // Close modal when clicking the dark overlay itself, not just the Cancel button
       document.getElementById("orderModal").addEventListener("click", (e) => {
         if (e.target.id === "orderModal") closeModal();
       });
@@ -661,7 +705,8 @@
           if (row.querySelector(".badge-pending")) pending++;
           if (
             row.querySelector(".badge-completed") ||
-            row.querySelector(".badge-paid")
+            row.querySelector(".badge-paid") ||
+            row.querySelector(".badge-cod")
           )
             completed++;
         });
@@ -671,10 +716,7 @@
       }
 
       function ensureTableExists() {
-        // If this is the customer's first-ever order, the empty state is
-        // showing instead of a table. Build the table shell in that case.
         if (document.getElementById("ordersTable")) return;
-
         const card = document.getElementById("ordersCard");
         card.innerHTML = `
           <div class="table-wrap" style="border: none; border-radius: 0">
@@ -716,17 +758,14 @@
         updateStats();
       }
 
-      // Registered once, outside submitOrder, so it never duplicates
       socket.on("new_order", (order) => {
-        // Guard against the same order being inserted twice (e.g. a
-        // duplicate emit or a reconnect), by skipping if it's already there.
         if (document.getElementById(`row-${order.id}`)) return;
         addOrderRow(order);
       });
 
-      // Fired by the server once staff mark an order as done.
-      // We swap the badge to "Completed" AND add a Pay button so the
-      // customer/staff can immediately collect payment.
+      // Fired once staff mark an order Done, now carrying kg + amount too
+      // (computed server-side from the kg the admin entered) so the Pay
+      // button already has everything it needs without another request.
       socket.on("order_completed", (order) => {
         const row = document.getElementById(`row-${order.id}`);
         if (!row) return;
@@ -742,15 +781,21 @@
           payBtn.className = "btn btn-sm btn-pay";
           payBtn.textContent = "Pay";
           payBtn.onclick = () =>
-            openPaymentModal(order.id, order.customer || "", order.phone || "");
+            openPaymentModal(
+              order.id,
+              order.customer || "",
+              order.phone || "",
+              order.kg || 0,
+              order.amount || 0,
+            );
           statusCell.appendChild(payBtn);
         }
 
         updateStats();
       });
 
-      // Fired by the server after the STK push resolves (customer entered
-      // PIN, cancelled, or it timed out) via the M-Pesa callback.
+      // Fired by the server after the STK push resolves via the M-Pesa
+      // callback.
       socket.on("payment_status", ({ order_id, status, reason }) => {
         if (currentPaymentOrder && currentPaymentOrder.id === order_id) {
           const statusBox = document.getElementById("stkStatus");
@@ -761,13 +806,15 @@
             showToast("Payment received");
             markRowPaid(order_id);
             setTimeout(closePaymentModal, 1500);
-          } else {
+          } else if (status === "failed") {
             statusBox.classList.remove("show");
             showToast(reason || "Payment was not completed", false);
             setPayOptionsDisabled(false);
           }
         } else if (status === "paid") {
           markRowPaid(order_id);
+        } else if (status === "cod") {
+          markRowCod(order_id);
         }
       });
 
@@ -775,20 +822,28 @@
         const row = document.getElementById(`row-${orderId}`);
         if (!row) return;
         const statusCell = row.querySelector(".status-cell");
-        const badge = statusCell.querySelector(".badge");
-        badge.textContent = "Paid";
-        badge.classList.remove("badge-completed", "badge-pending");
-        badge.classList.add("badge-paid");
-        const payBtn = statusCell.querySelector(".btn-pay");
-        if (payBtn) payBtn.remove();
+        statusCell.innerHTML = '<span class="badge badge-paid">Paid</span>';
       }
 
-      function openPaymentModal(id, customer, phone) {
-        currentPaymentOrder = { id, customer, phone };
+      function markRowCod(orderId) {
+        const row = document.getElementById(`row-${orderId}`);
+        if (!row) return;
+        const statusCell = row.querySelector(".status-cell");
+        statusCell.innerHTML =
+          '<span class="badge badge-cod">Pay on delivery</span>';
+      }
+
+      function openPaymentModal(id, customer, phone, kg, amount) {
+        currentPaymentOrder = { id, customer, phone, kg, amount };
         document.getElementById("payOrderLabel").textContent = `#${id}`;
         document.getElementById("payOrderSubtitle").textContent =
           `${customer} · ${phone}`;
-        document.getElementById("payAmount").value = "";
+        document.getElementById("payWeight").textContent = kg
+          ? `${kg} kg`
+          : "– kg";
+        document.getElementById("payAmount").textContent = amount
+          ? `KES ${amount}`
+          : "KES –";
         document.getElementById("stkStatus").classList.remove("show");
         setPayOptionsDisabled(false);
         document.getElementById("paymentModal").classList.add("open");
@@ -809,11 +864,6 @@
       }
 
       async function choosePayNow() {
-        const amount = document.getElementById("payAmount").value.trim();
-        if (!amount || Number(amount) <= 0) {
-          showToast("Enter an amount first", false);
-          return;
-        }
         if (!currentPaymentOrder) return;
 
         setPayOptionsDisabled(true);
@@ -823,22 +873,18 @@
         statusText.textContent = "Sending the payment prompt…";
 
         try {
+          // Only order_id goes to the server now — it looks up phone and
+          // amount itself, so nothing the customer could edit is trusted.
           const res = await fetch("/stk_push", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              order_id: currentPaymentOrder.id,
-              phone: currentPaymentOrder.phone,
-              amount: Number(amount),
-            }),
+            body: JSON.stringify({ order_id: currentPaymentOrder.id }),
           });
           const data = await res.json();
 
           if (data.success) {
             statusText.textContent =
               "Prompt sent. Ask the customer to check their phone and enter their M-Pesa PIN.";
-            // Final result arrives asynchronously via the "payment_status"
-            // socket event once M-Pesa calls our /mpesa/callback endpoint.
           } else {
             statusBox.classList.remove("show");
             showToast(
@@ -872,6 +918,7 @@
 
           if (data.success) {
             showToast("Marked as pay after delivery");
+            markRowCod(currentPaymentOrder.id);
             closePaymentModal();
           } else {
             showToast(data.message || "Could not update order", false);
@@ -910,8 +957,6 @@
             showToast("Order placed successfully");
             clearOrderForm();
             closeModal();
-            // The row itself is added via the "new_order" socket event,
-            // not here, so there's exactly one insertion, not two.
           } else {
             showToast(data.message || "Could not place order", false);
           }

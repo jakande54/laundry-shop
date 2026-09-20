@@ -40,19 +40,32 @@ app.post("/stk_push", async (req, res) => {
     const passkey = process.env.MPESA_PASSKEY;
     const password = Buffer.from(shortcode + passkey + timestamp).toString("base64");
 
-    const payload = {
-      BusinessShortCode: shortcode,
-      Password: password,
-      Timestamp: timestamp,
-      TransactionType: "CustomerPayBillOnline",
-      Amount: amount,
-      PartyA: phone, // customer phone
-      PartyB: shortcode,
-      PhoneNumber: phone,
-      CallBackURL: `${process.env.BASE_URL}/mpesa/callback`,
-      AccountReference: `Order-${order_id}`,
-      TransactionDesc: "Payment for order",
-    };
+    
+const payload = {
+  "Password": "MTc0Mzc5YmZiMjc5ZjlhYTliZGJjZjE1OGU5N2RkNzFhNDY3Y2QyZTBjODkzMDU5YjEwZjc4ZTZiNzJhZGExZWQyYzkxOTIwMjYwOTE0MTMzMDIy",
+  "BusinessShortCode": "174379",
+  "Timestamp": "20260914133022",
+  "Amount": "1",
+  "PartyA": "254790502077",
+  "PartyB": "174379",
+  "TransactionType": "CustomerPayBillOnline",
+  "PhoneNumber": "254110437237",
+  "TransactionDesc": "Test",
+  "AccountReference": "Test",
+  "CallBackURL": " https://stoppage-fretted-bagful.ngrok-free.dev"
+};
+
+fetch("https://api.safaricom.co.ke/YOUR_ENDPOINT", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    Authorization: "Bearer <ACCESS_TOKEN>"
+  },
+  body: JSON.stringify(payload)
+})
+  .then(res => res.json())
+  .then(console.log)
+  .catch(console.error);
 
     const stkRes = await fetch(
       "https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest",

@@ -17,6 +17,7 @@
         --green: #059669;
         --red: #dc2626;
         --orange: #d97706;
+        --purple: #6d28d9;
         --bg: #f8fafc;
         --card: #ffffff;
         --text: #111827;
@@ -170,6 +171,31 @@
         color: #065f46;
       }
 
+      .badge-paid {
+        background: #dbeafe;
+        color: #1e40af;
+      }
+
+      .badge-unpaid {
+        background: #f3f4f6;
+        color: #374151;
+      }
+
+      .badge-cod {
+        background: #ede9fe;
+        color: var(--purple);
+      }
+
+      .badge-admin {
+        background: #dbeafe;
+        color: #1e40af;
+      }
+
+      .badge-user {
+        background: #f3f4f6;
+        color: #374151;
+      }
+
       /* Buttons */
 
       .btn {
@@ -305,13 +331,14 @@
         <div class="stat-card">
           <div class="stat-label">Pending</div>
           <div class="stat-value" id="pendingCount" style="color: #d97706">
-            {{ orders|selectattr('4','equalto','Pending')|list|length }}
+            {{ orders|selectattr('status', 'equalto', 'Pending')|list|length }}
           </div>
         </div>
         <div class="stat-card">
           <div class="stat-label">Completed</div>
           <div class="stat-value" id="completedCount" style="color: #059669">
-            {{ orders|selectattr('4','equalto','Completed')|list|length }}
+            {{ orders|selectattr('status', 'equalto', 'Completed')|list|length
+            }}
           </div>
         </div>
         <div class="stat-card">
@@ -352,38 +379,72 @@
                 <th>Phone</th>
                 <th>Service</th>
                 <th>Status</th>
+                <th>Kg</th>
+                <th>Amount</th>
+                <th>Payment</th>
                 <th>Actions</th>
               </tr>
             </thead>
             <tbody>
-              {% for o in orders %}
-              <tr id="row-{{ o[0] }}">
+              {% for order in orders %}
+              <tr id="row-{{ order.id }}" data-order-id="{{ order.id }}">
                 <td style="color: var(--muted); font-size: 0.8rem">
-                  #{{ o[0] }}
+                  #{{ order.id }}
                 </td>
-                <td>{{ o[1] }}</td>
-                <td>{{ o[2] }}</td>
-                <td>{{ o[3] }}</td>
+                <td>{{ order.customer }}</td>
+                <td>{{ order.phone }}</td>
+                <td>{{ order.service }}</td>
                 <td>
                   <span
-                    class="badge {% if o[4] == 'Completed' %}badge-completed{% else %}badge-pending{% endif %}"
+                    class="badge {% if order.status == 'Completed' %}badge-completed{% else %}badge-pending{% endif %}"
                   >
-                    {{ o[4] }}
+                    {{ order.status }}
                   </span>
+                </td>
+                <td id="kg-{{ order.id }}">
+                  {{ order.kg and (order.kg|string + ' kg') or '–' }}
+                </td>
+                <td id="amount-{{ order.id }}">
+                  {{ order.amount and ('KES ' + order.amount|string) or '–' }}
+                </td>
+                <td>
+                  <div
+                    style="
+                      display: flex;
+                      align-items: center;
+                      gap: 0.4rem;
+                      flex-wrap: wrap;
+                    "
+                  >
+                    <span
+                      id="payment-{{ order.id }}"
+                      class="badge {% if order.payment_status == 'paid' %}badge-paid{% elif order.payment_status == 'cod' %}badge-cod{% else %}badge-unpaid{% endif %}"
+                    >
+                      {{ order.payment_status|default('unpaid') }}
+                    </span>
+                    {% if order.payment_status == 'cod' %}
+                    <button
+                      class="btn btn-success btn-sm btn-mark-paid"
+                      data-id="{{ order.id }}"
+                    >
+                      Mark Paid
+                    </button>
+                    {% endif %}
+                  </div>
                 </td>
                 <td>
                   <div class="row-actions" style="display: flex; gap: 0.4rem">
-                    {% if o[4] != 'Completed' %}
+                    {% if order.status != 'Completed' %}
                     <button
                       class="btn btn-success btn-sm btn-done"
-                      onclick="completeOrder({{ o[0] }})"
+                      data-id="{{ order.id }}"
                     >
                       ✓ Done
                     </button>
                     {% endif %}
                     <button
-                      class="btn btn-danger btn-sm"
-                      onclick="deleteOrder({{ o[0] }})"
+                      class="btn btn-danger btn-sm btn-delete"
+                      data-id="{{ order.id }}"
                     >
                       Delete
                     </button>
@@ -420,25 +481,24 @@
             </thead>
             <tbody id="usersTableBody">
               {% for u in users %}
-              <tr id="user-row-{{ u[0] }}">
+              <tr id="user-row-{{ u.id }}">
                 <td style="color: var(--muted); font-size: 0.8rem">
-                  {{ u[0] }}
+                  {{ u.id }}
                 </td>
-                <td>{{ u[1] }}</td>
-                <td>{{ u[2] }}</td>
+                <td>{{ u.fullname }}</td>
+                <td>{{ u.username }}</td>
                 <td>
                   <span
-                    class="badge"
-                    style="{% if u[4]=='ADMIN' %}background:#dbeafe; color:#1e40af;{% else %}background:#f3f4f6; color:#374151;{% endif %}"
+                    class="badge {% if u.role == 'ADMIN' %}badge-admin{% else %}badge-user{% endif %}"
                   >
-                    {{ u[4] }}
+                    {{ u.role }}
                   </span>
                 </td>
                 <td>
-                  {% if u[4] != 'ADMIN' %}
+                  {% if u.role != 'ADMIN' %}
                   <button
-                    class="btn btn-danger btn-sm"
-                    onclick="deleteUser({{ u[0] }})"
+                    class="btn btn-danger btn-sm btn-user-delete"
+                    data-id="{{ u.id }}"
                   >
                     Delete
                   </button>
@@ -449,6 +509,58 @@
             </tbody>
           </table>
         </div>
+      </div>
+      <!-- Payment History -->
+      <h2 style="font-size: 1rem; font-weight: 600; margin: 2rem 0 1rem">
+        Payment History
+      </h2>
+      <div class="card" style="padding: 0; overflow: hidden">
+        {% if payments %}
+        <div class="table-wrap" style="border: none; border-radius: 0">
+          <table>
+            <thead>
+              <tr>
+                <th>Order #</th>
+                <th>Customer</th>
+                <th>Method</th>
+                <th>Amount</th>
+                <th>Status</th>
+                <th>Reference</th>
+                <th>When</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for p in payments %}
+              <tr>
+                <td style="color: var(--muted); font-size: 0.8rem">
+                  #{{ p.order_id }}
+                </td>
+                <td>{{ p.customer or '–' }}</td>
+                <td>{{ p.method }}</td>
+                <td>{{ p.amount and ('KES ' + p.amount|string) or '–' }}</td>
+                <td>
+                  <span
+                    class="badge {% if p.status == 'paid' %}badge-paid{% elif p.status == 'cod' %}badge-cod{% elif p.status == 'failed' %}badge-unpaid{% else %}badge-pending{% endif %}"
+                  >
+                    {{ p.status }}
+                  </span>
+                </td>
+                <td style="font-size: 0.8rem; color: var(--muted)">
+                  {{ p.reference or '–' }}
+                </td>
+                <td style="font-size: 0.8rem; color: var(--muted)">
+                  {{ p.created_at }}
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% else %}
+        <div class="empty-state">
+          <div style="font-weight: 600">No payment activity yet</div>
+        </div>
+        {% endif %}
       </div>
     </div>
 
@@ -491,6 +603,9 @@
                   <th>Phone</th>
                   <th>Service</th>
                   <th>Status</th>
+                  <th>Kg</th>
+                  <th>Amount</th>
+                  <th>Payment</th>
                   <th>Actions</th>
                 </tr>
               </thead>
@@ -512,29 +627,98 @@
 
       function buildOrderRowHtml(order) {
         return `
-          <tr id="row-${order.id}">
-            <td style="color: var(--muted); font-size: 0.8rem">#${order.id}</td>
-            <td>${order.customer}</td>
-            <td>${order.phone}</td>
-            <td>${order.service}</td>
-            <td><span class="badge badge-pending">Pending</span></td>
-            <td>
-              <div class="row-actions" style="display: flex; gap: 0.4rem">
-                <button class="btn btn-success btn-sm btn-done" onclick="completeOrder(${order.id})">✓ Done</button>
-                <button class="btn btn-danger btn-sm" onclick="deleteOrder(${order.id})">Delete</button>
-              </div>
-            </td>
-          </tr>
-        `;
+    <tr id="row-${order.id}">
+      <td style="color: var(--muted); font-size: 0.8rem">#${order.id}</td>
+      <td>${order.customer}</td>
+      <td>${order.phone}</td>
+      <td>${order.service}</td>
+      <td><span class="badge badge-pending">Pending</span></td>
+      <td id="kg-${order.id}">–</td>
+      <td id="amount-${order.id}">–</td>
+      <td><span id="payment-${order.id}" class="badge badge-unpaid">unpaid</span></td>
+      <td>
+        <div class="row-actions" style="display: flex; gap: 0.4rem">
+          <button class="btn btn-success btn-sm btn-done" data-id="${order.id}">✓ Done</button>
+          <button class="btn btn-danger btn-sm btn-delete" data-id="${order.id}">Delete</button>
+        </div>
+      </td>
+    </tr>
+  `;
       }
 
-      async function completeOrder(id) {
+      // Attach one listener for all clicks on the page
+      document.addEventListener("click", (e) => {
+        if (e.target.classList.contains("btn-done")) {
+          const id = e.target.dataset.id;
+          completeOrder(id);
+        }
+        if (e.target.classList.contains("btn-delete")) {
+          const id = e.target.dataset.id;
+          deleteOrder(id);
+        }
+        if (e.target.classList.contains("btn-user-delete")) {
+          const id = e.target.dataset.id;
+          deleteUser(id);
+        }
+        if (e.target.classList.contains("btn-mark-paid")) {
+          const id = e.target.dataset.id;
+          markPaid(id);
+        }
+      });
+
+      // Settles a cod order once cash is actually collected — turns
+      // "Pay on delivery" into "Paid" instead of it staying that way
+      // permanently.
+      async function markPaid(id) {
+        if (!confirm("Confirm payment has been collected for this order?"))
+          return;
+
         try {
-          const res = await fetch(`/complete/${id}`);
+          const res = await fetch(`/mark_paid/${id}`, { method: "POST" });
           const data = await res.json();
 
           if (data.success) {
-            showToast("Order marked complete");
+            showToast("Marked as paid");
+            const badge = document.getElementById(`payment-${id}`);
+            if (badge) {
+              badge.className = "badge badge-paid";
+              badge.textContent = "paid";
+              const markBtn =
+                badge.parentElement.querySelector(".btn-mark-paid");
+              if (markBtn) markBtn.remove();
+            }
+          } else {
+            showToast(data.message || "Could not mark as paid", false);
+          }
+        } catch (error) {
+          console.error(error);
+          showToast("Server error. Please try again.", false);
+        }
+      }
+
+      // Marking an order Done now asks for the weight washed. The server
+      // computes the amount from that (kg x price/kg) — nobody types a
+      // price anywhere, here or on the customer's side.
+      async function completeOrder(id) {
+        const kgInput = prompt("Total weight washed (kg):");
+        if (kgInput === null) return; // admin cancelled
+
+        const kg = parseFloat(kgInput);
+        if (isNaN(kg) || kg <= 0) {
+          showToast("Enter a valid weight in kg", false);
+          return;
+        }
+
+        try {
+          const res = await fetch(`/complete/${id}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ kg }),
+          });
+          const data = await res.json();
+
+          if (data.success) {
+            showToast(`Order marked complete — KES ${data.amount}`);
             const row = document.getElementById(`row-${id}`);
             if (row) {
               const badge = row.querySelector(".badge");
@@ -542,6 +726,10 @@
               badge.textContent = "Completed";
               const doneBtn = row.querySelector(".btn-done");
               if (doneBtn) doneBtn.remove();
+              const kgCell = document.getElementById(`kg-${id}`);
+              if (kgCell) kgCell.textContent = `${data.kg} kg`;
+              const amountCell = document.getElementById(`amount-${id}`);
+              if (amountCell) amountCell.textContent = `KES ${data.amount}`;
             }
             updateOrderStats();
           } else {
@@ -627,8 +815,6 @@
       // ---- Real-time updates from other sessions (other admins, customers) ----
 
       socket.on("new_order", (order) => {
-        // Guard against the same order being inserted twice (e.g. a
-        // duplicate emit or a reconnect), by skipping if it's already there.
         if (document.getElementById(`row-${order.id}`)) return;
         ensureOrdersTableExists();
         const tbody = document.querySelector("#ordersTable tbody");
@@ -637,14 +823,21 @@
         showToast("New order received!");
       });
 
-      socket.on("order_completed", ({ id }) => {
-        const row = document.getElementById(`row-${id}`);
+      // Now also carries kg + amount, computed by whichever admin
+      // completed the order, so every open dashboard reflects it.
+      socket.on("order_completed", (order) => {
+        const row = document.getElementById(`row-${order.id}`);
         if (row) {
           const badge = row.querySelector(".badge");
           badge.className = "badge badge-completed";
           badge.textContent = "Completed";
           const doneBtn = row.querySelector(".btn-done");
           if (doneBtn) doneBtn.remove();
+          const kgCell = document.getElementById(`kg-${order.id}`);
+          if (kgCell && order.kg) kgCell.textContent = `${order.kg} kg`;
+          const amountCell = document.getElementById(`amount-${order.id}`);
+          if (amountCell && order.amount)
+            amountCell.textContent = `KES ${order.amount}`;
         }
         updateOrderStats();
       });
@@ -668,6 +861,80 @@
       socket.on("user_deleted", ({ id }) => {
         const row = document.getElementById(`user-row-${id}`);
         if (row) row.remove();
+      });
+
+      // Fired once M-Pesa resolves an STK push, or the customer picks
+      // "pay after delivery" — updates the Payment badge live AND keeps the
+      // Mark Paid button in sync (previously this only updated the badge
+      // text/color, so a live "cod" event never added the button — it only
+      // ever showed up after a page refresh, which re-ran the Jinja check).
+      socket.on("payment_status", ({ order_id, status }) => {
+        const badge = document.getElementById(`payment-${order_id}`);
+        if (!badge) return;
+        const wrapper = badge.parentElement;
+        const existingBtn = wrapper
+          ? wrapper.querySelector(".btn-mark-paid")
+          : null;
+
+        if (status === "paid") {
+          badge.className = "badge badge-paid";
+          badge.textContent = "paid";
+          if (existingBtn) existingBtn.remove();
+        } else if (status === "cod") {
+          badge.className = "badge badge-cod";
+          badge.textContent = "cod";
+          if (wrapper && !existingBtn) {
+            const btn = document.createElement("button");
+            btn.className = "btn btn-success btn-sm btn-mark-paid";
+            btn.dataset.id = order_id;
+            btn.textContent = "Mark Paid";
+            wrapper.appendChild(btn);
+          }
+        } else if (status === "failed") {
+          badge.className = "badge badge-unpaid";
+          badge.textContent = "unpaid";
+          if (existingBtn) existingBtn.remove();
+        }
+      });
+
+      // Fired right after a customer registers — adds them to the Users
+      // table and bumps the count without needing a refresh.
+      socket.on("new_user", (user) => {
+        if (document.getElementById(`user-row-${user.id}`)) return;
+
+        const tbody = document.getElementById("usersTableBody");
+        if (tbody) {
+          const isAdmin = user.role === "ADMIN";
+          tbody.insertAdjacentHTML(
+            "afterbegin",
+            `
+            <tr id="user-row-${user.id}">
+              <td style="color: var(--muted); font-size: 0.8rem">${user.id}</td>
+              <td>${user.fullname}</td>
+              <td>${user.username}</td>
+              <td>
+                <span class="badge ${isAdmin ? "badge-admin" : "badge-user"}">
+                  ${user.role}
+                </span>
+              </td>
+              <td>
+                ${
+                  isAdmin
+                    ? ""
+                    : `<button class="btn btn-danger btn-sm btn-user-delete" data-id="${user.id}">Delete</button>`
+                }
+              </td>
+            </tr>
+          `,
+          );
+        }
+
+        const countEl = document.getElementById("userCount");
+        if (countEl) {
+          countEl.textContent = parseInt(countEl.textContent, 10) + 1;
+        }
+
+        showToast(`New customer registered: ${user.fullname}`);
       });
     </script>
   </body>

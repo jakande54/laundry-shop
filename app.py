@@ -1,13 +1,22 @@
 from flask import Flask, redirect, render_template, request, jsonify, session
 from functools import wraps
-import sqlite3
-import base64
 import os
-from datetime import datetime, timedelta
+import base64
+from datetime import timedelta, datetime
 import requests
+import psycopg2
+import psycopg2.extras
+from dotenv import load_dotenv
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_socketio import SocketIO, join_room
+
+# Reads a .env file sitting next to app.py and loads its KEY=value lines as
+# environment variables. This is what actually fixes "not configured" —
+# variables set with $env: in PowerShell (or set in cmd) only last for that
+# one terminal session; a .env file is read fresh every time the app starts,
+# so it survives closing VS Code, restarting, rebooting, etc.
+load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
@@ -15,28 +24,53 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 
 app.secret_key = "mic-cheque-1-2"
 
-# Keep the session alive across page refreshes instead of losing login state
 app.config["SESSION_PERMANENT"] = True
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=1)
-# Don't let Flask re-read templates from disk on every single request
 app.config["TEMPLATES_AUTO_RELOAD"] = False
+
+
+# =====================================
+# DATABASE (PostgreSQL)
+# =====================================
+# One DATABASE_URL covers local dev and production alike. Point it at a
+# local Postgres while developing, and at a managed Postgres (Render,
+# Supabase, Neon, RDS, etc.) once this is actually deployed, so several
+# phones/tablets/PCs can hit the same server at once. SQLite locks the
+# whole file per write, which is fine for one person testing locally but
+# starts throwing "database is locked" once multiple devices place and pay
+# for orders concurrently — that's the actual problem Postgres solves here.
+#
+# Local setup, one time:
+#   createdb laundry_db
+#   export DATABASE_URL=postgresql://laundry_user:laundry_pass@localhost:5432/laundry_db
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://laundry_user:laundry_pass@localhost:5432/laundry_db",
+)
+
+
+def get_db():
+    """Every request opens its own connection — the simplest correct thing
+    for a small app. If this gets busy, swap this for a connection pool
+    (psycopg2.pool.SimpleConnectionPool, or move to SQLAlchemy) later."""
+    return psycopg2.connect(DATABASE_URL)
+
+
+def dict_cursor(conn):
+    """Rows come back as dict-like objects, so templates keep reading
+    o.id / o.status / o.kg by name — same as sqlite3.Row did before."""
+    return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+
+# =====================================
+# PRICING
+# =====================================
+PRICE_PER_KG = float(os.environ.get("PRICE_PER_KG", 100))
 
 
 # =====================================
 # M-PESA (DARAJA) CONFIG
 # =====================================
-# Set these as real environment variables before running the app.
-# Sandbox docs / test credentials: https://developer.safaricom.co.ke/
-#
-#   export MPESA_CONSUMER_KEY=...
-#   export MPESA_CONSUMER_SECRET=...
-#   export MPESA_SHORTCODE=174379          # sandbox test paybill
-#   export MPESA_PASSKEY=...               # given with the sandbox shortcode
-#   export MPESA_CALLBACK_URL=https://<your-public-url>/mpesa/callback
-#
-# CALLBACK_URL must be a public HTTPS URL Safaricom's servers can reach —
-# on localhost you need a tunnel (e.g. `ngrok http 5001`) while testing.
-
 MPESA_BASE_URL = os.environ.get("MPESA_BASE_URL", "https://sandbox.safaricom.co.ke")
 MPESA_CONSUMER_KEY = os.environ.get("MPESA_CONSUMER_KEY", "")
 MPESA_CONSUMER_SECRET = os.environ.get("MPESA_CONSUMER_SECRET", "")
@@ -93,23 +127,17 @@ def login_required(role=None, api=False):
     return decorator
 
 
-def get_db():
-    conn = sqlite3.connect("laundry.db")
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
 # =====================================
 # DATABASE INITIALIZATION
 # =====================================
 
 def init_db():
-    conn = sqlite3.connect("laundry.db")
-    c = conn.cursor()
+    conn = get_db()
+    cur = conn.cursor()
 
-    c.execute("""
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS users(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         fullname TEXT NOT NULL,
         username TEXT UNIQUE NOT NULL,
         password TEXT NOT NULL,
@@ -117,41 +145,68 @@ def init_db():
     )
     """)
 
-    # orders now tracks which user placed it, so customers only see their own
-    c.execute("""
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS orders(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id),
         customer TEXT,
         phone TEXT,
         service TEXT,
-        status TEXT DEFAULT 'Pending',
-        FOREIGN KEY (user_id) REFERENCES users(id)
+        status TEXT DEFAULT 'Pending'
     )
     """)
 
-    # Payment columns, added via ALTER so an existing laundry.db upgrades in
-    # place instead of needing to be deleted. sqlite3 has no
-    # "ADD COLUMN IF NOT EXISTS", so we just swallow the error if the
-    # column is already there from a previous run.
+    # Postgres supports "ADD COLUMN IF NOT EXISTS" directly (9.6+), so this
+    # doesn't need the try/except dance sqlite required.
     for ddl in (
-        "ALTER TABLE orders ADD COLUMN payment_status TEXT DEFAULT 'unpaid'",
-        "ALTER TABLE orders ADD COLUMN payment_method TEXT",
-        "ALTER TABLE orders ADD COLUMN checkout_request_id TEXT",
-        "ALTER TABLE orders ADD COLUMN amount INTEGER",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_status TEXT DEFAULT 'unpaid'",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method TEXT",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS checkout_request_id TEXT",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS amount INTEGER",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS mpesa_receipt TEXT",
+        "ALTER TABLE orders ADD COLUMN IF NOT EXISTS kg REAL",
     ):
-        try:
-            c.execute(ddl)
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        cur.execute(ddl)
 
-    c.execute(
-        "INSERT OR IGNORE INTO users (fullname, username, password, role) VALUES (?, ?, ?, ?)",
+    # Payment history — a running log of every payment EVENT (an STK push
+    # started, succeeded, failed; cod chosen; cash settled later), separate
+    # from orders which only ever shows the CURRENT state. This is what
+    # actually lets you track payments, not just see where things stand now.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS payments(
+        id SERIAL PRIMARY KEY,
+        order_id INTEGER REFERENCES orders(id),
+        method TEXT,       -- 'mpesa' or 'cash'
+        amount INTEGER,
+        status TEXT,       -- 'pending', 'paid', 'failed', 'cod'
+        reference TEXT,    -- M-Pesa receipt number, or NULL for cash
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    cur.execute(
+        """
+        INSERT INTO users (fullname, username, password, role)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (username) DO NOTHING
+        """,
         ('System Administrator', 'admin', generate_password_hash('admin123'), 'ADMIN')
     )
 
     conn.commit()
+    cur.close()
     conn.close()
+
+
+def log_payment(conn, order_id, method, amount, status, reference=None):
+    """Appends one row to the payments log. Doesn't commit — the caller
+    commits alongside its own orders UPDATE so both happen atomically."""
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO payments(order_id, method, amount, status, reference) VALUES (%s, %s, %s, %s, %s)",
+        (order_id, method, amount, status, reference)
+    )
+    cur.close()
 
 
 # =====================================
@@ -170,19 +225,19 @@ def login():
         username = data.get('username', '')
         password = data.get('password', '')
 
-        conn = sqlite3.connect("laundry.db")
-        c = conn.cursor()
-        c.execute("SELECT * FROM users WHERE username=?", (username,))
-        user = c.fetchone()
+        conn = get_db()
+        cur = dict_cursor(conn)
+        cur.execute("SELECT * FROM users WHERE username=%s", (username,))
+        user = cur.fetchone()
+        cur.close()
         conn.close()
 
-        if user and check_password_hash(user[3], password):
+        if user and check_password_hash(user['password'], password):
             session.permanent = True
-            session['user_id'] = user[0]
-            session['fullname'] = user[1]
-            session['role'] = user[4]
-
-            return jsonify({"success": True, "role": user[4]})
+            session['user_id'] = user['id']
+            session['fullname'] = user['fullname']
+            session['role'] = user['role']
+            return jsonify({"success": True, "role": user['role']})
 
         return jsonify({"success": False, "message": "Invalid username or password"})
 
@@ -202,30 +257,35 @@ def register():
         if not fullname or not username or not password:
             return jsonify({"success": False, "message": "Missing required fields"})
 
+        conn = get_db()
+        cur = conn.cursor()
         try:
-            conn = sqlite3.connect("laundry.db")
-            c = conn.cursor()
-
             hashed_password = generate_password_hash(password)
-
-            # This now correctly inserts into the users table (it was
-            # previously inserting into `orders` with undefined variables)
-            c.execute(
-                """
-                INSERT INTO users (fullname, username, password, role)
-                VALUES (?, ?, ?, ?)
-                """,
+            cur.execute(
+                "INSERT INTO users (fullname, username, password, role) VALUES (%s, %s, %s, %s) RETURNING id",
                 (fullname, username, hashed_password, role)
             )
+            new_user_id = cur.fetchone()[0]
             conn.commit()
-            conn.close()
+
+            # Let any open admin dashboard add this account to its Users
+            # table live, instead of only showing up after a refresh.
+            socketio.emit(
+                "new_user",
+                {"id": new_user_id, "fullname": fullname, "username": username, "role": role},
+                room="admins",
+            )
 
             return jsonify({"success": True, "message": "Account created successfully"})
-
-        except sqlite3.IntegrityError:
+        except psycopg2.errors.UniqueViolation:
+            conn.rollback()
             return jsonify({"success": False, "message": "Username already exists"})
         except Exception as e:
+            conn.rollback()
             return jsonify({"success": False, "message": str(e)})
+        finally:
+            cur.close()
+            conn.close()
 
     return render_template('register.html')
 
@@ -239,24 +299,23 @@ def logout():
 # =====================================
 # CUSTOMER DASHBOARD
 # =====================================
-# NOTE: SELECT lists columns by name (not "SELECT *") and get_db()'s
-# sqlite3.Row lets the template read o.id / o.customer / o.status / etc.
-# by name. Doing this by position used to break as soon as `user_id`
-# (or, now, the payment columns) shifted every later index by one.
 
 @app.route('/customer')
 @login_required(role="CUSTOMER")
 def customer_dashboard():
     conn = get_db()
-    orders = conn.execute(
+    cur = dict_cursor(conn)
+    cur.execute(
         """
-        SELECT id, customer, phone, service, status, payment_status
+        SELECT id, customer, phone, service, status, payment_status, kg, amount
         FROM orders
-        WHERE user_id=?
+        WHERE user_id=%s
         ORDER BY id DESC
         """,
         (session['user_id'],)
-    ).fetchall()
+    )
+    orders = cur.fetchall()
+    cur.close()
     conn.close()
     return render_template("customer_dashboard.html", orders=orders, fullname=session.get('fullname'))
 
@@ -268,14 +327,44 @@ def customer_dashboard():
 @app.route('/admin')
 @login_required(role="ADMIN")
 def admin_dashboard():
-    conn = sqlite3.connect("laundry.db")
-    c = conn.cursor()
-    c.execute("SELECT * FROM orders")
-    orders = c.fetchall()
-    c.execute("SELECT * FROM users")
-    users = c.fetchall()
+    conn = get_db()
+    cur = dict_cursor(conn)
+
+    cur.execute(
+        """
+        SELECT id, customer, phone, service, status, payment_status, kg, amount
+        FROM orders
+        ORDER BY id DESC
+        """
+    )
+    orders = cur.fetchall()
+
+    cur.execute("SELECT id, fullname, username, role FROM users")
+    users = cur.fetchall()
+
+    # Recent payment history — attempts, successes, failures, cod picks,
+    # cash settlements — joined with customer name for readability.
+    cur.execute(
+        """
+        SELECT p.id, p.order_id, p.method, p.amount, p.status, p.reference, p.created_at,
+               o.customer
+        FROM payments p
+        LEFT JOIN orders o ON o.id = p.order_id
+        ORDER BY p.id DESC
+        LIMIT 50
+        """
+    )
+    payments = cur.fetchall()
+
+    cur.close()
     conn.close()
-    return render_template("admin_dashboard.html", orders=orders, users=users, fullname=session.get('fullname'))
+    return render_template(
+        "admin_dashboard.html",
+        orders=orders,
+        users=users,
+        payments=payments,
+        fullname=session.get('fullname'),
+    )
 
 
 # =====================================
@@ -285,10 +374,11 @@ def admin_dashboard():
 @app.route('/orders', methods=['GET'])
 @login_required(api=True)
 def get_orders():
-    conn = sqlite3.connect("laundry.db")
-    c = conn.cursor()
-    c.execute("SELECT * FROM orders ORDER BY id DESC")
-    orders = c.fetchall()
+    conn = get_db()
+    cur = dict_cursor(conn)
+    cur.execute("SELECT * FROM orders ORDER BY id DESC")
+    orders = cur.fetchall()
+    cur.close()
     conn.close()
     return jsonify(orders)
 
@@ -298,10 +388,11 @@ def orders_data():
     if 'user_id' not in session:
         return jsonify([])
 
-    conn = sqlite3.connect("laundry.db")
-    c = conn.cursor()
-    c.execute("SELECT * FROM orders")
-    orders = c.fetchall()
+    conn = get_db()
+    cur = dict_cursor(conn)
+    cur.execute("SELECT * FROM orders")
+    orders = cur.fetchall()
+    cur.close()
     conn.close()
     return jsonify(orders)
 
@@ -315,18 +406,21 @@ def add_order():
         phone = data["phone"]
         service = data["service"]
 
-        conn = sqlite3.connect("laundry.db")
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO orders(user_id, customer, phone, service, status) VALUES (?, ?, ?, ?, ?)",
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO orders(user_id, customer, phone, service, status)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id
+            """,
             (session['user_id'], customer, phone, service, "Pending")
         )
+        new_order_id = cur.fetchone()[0]
         conn.commit()
-        new_order_id = c.lastrowid  # actual id of the row just inserted
+        cur.close()
         conn.close()
 
-        # Only notify the customer who placed this order, not every
-        # connected client, so customers can't see each other's orders live.
         order_payload = {
             "id": new_order_id,
             "customer": customer,
@@ -335,7 +429,6 @@ def add_order():
             "status": "Pending"
         }
         socketio.emit("new_order", order_payload, room=str(session['user_id']))
-        # Admins need to see every new order regardless of who placed it.
         socketio.emit("new_order", order_payload, room="admins")
 
         return jsonify({"success": True, "message": "Order added successfully"})
@@ -344,48 +437,67 @@ def add_order():
         return jsonify({"success": False, "message": str(e)})
 
 
-@app.route('/complete/<int:order_id>')
+@app.route('/complete/<int:order_id>', methods=['POST'])
 @login_required(role="ADMIN", api=True)
 def complete_order(order_id):
-    conn = sqlite3.connect("laundry.db")
-    c = conn.cursor()
+    """Marks an order Completed. The admin supplies the weight washed (kg);
+    the amount to charge is computed here from PRICE_PER_KG."""
+    data = request.get_json(silent=True) or {}
+    try:
+        kg = float(data.get("kg"))
+    except (TypeError, ValueError):
+        kg = None
 
-    # Look up who owns this order BEFORE updating, so we notify the right
-    # customer, and so we can send customer/phone along with the event —
-    # the frontend's "Pay" button needs them without a second round trip.
-    c.execute("SELECT user_id, customer, phone FROM orders WHERE id=?", (order_id,))
-    row = c.fetchone()
-    owner_id = row[0] if row else None
-    customer = row[1] if row else ""
-    phone = row[2] if row else ""
+    if not kg or kg <= 0:
+        return jsonify({"success": False, "message": "Enter the total weight in kg"}), 400
 
-    c.execute("UPDATE orders SET status='Completed' WHERE id=?", (order_id,))
+    amount = round(kg * PRICE_PER_KG)
+
+    conn = get_db()
+    cur = dict_cursor(conn)
+    cur.execute("SELECT user_id, customer, phone FROM orders WHERE id=%s", (order_id,))
+    row = cur.fetchone()
+    if not row:
+        cur.close()
+        conn.close()
+        return jsonify({"success": False, "message": "Order not found"}), 404
+
+    cur.execute(
+        "UPDATE orders SET status='Completed', kg=%s, amount=%s WHERE id=%s",
+        (kg, amount, order_id)
+    )
     conn.commit()
+    cur.close()
     conn.close()
 
-    payload = {"id": order_id, "customer": customer, "phone": phone}
+    payload = {
+        "id": order_id,
+        "customer": row["customer"],
+        "phone": row["phone"],
+        "kg": kg,
+        "amount": amount,
+    }
 
-    if owner_id is not None:
-        socketio.emit("order_completed", payload, room=str(owner_id))
-    # Other admin sessions need to see the update too, not just the customer.
+    if row["user_id"] is not None:
+        socketio.emit("order_completed", payload, room=str(row["user_id"]))
     socketio.emit("order_completed", payload, room="admins")
 
-    return jsonify({"success": True})
+    return jsonify({"success": True, "kg": kg, "amount": amount})
 
 
 @app.route('/delete/<int:order_id>', methods=['DELETE'])
 @login_required(role="ADMIN", api=True)
 def delete_order(order_id):
     try:
-        conn = sqlite3.connect("laundry.db")
-        c = conn.cursor()
+        conn = get_db()
+        cur = dict_cursor(conn)
+        cur.execute("SELECT user_id FROM orders WHERE id=%s", (order_id,))
+        row = cur.fetchone()
+        owner_id = row["user_id"] if row else None
 
-        c.execute("SELECT user_id FROM orders WHERE id=?", (order_id,))
-        row = c.fetchone()
-        owner_id = row[0] if row else None
-
-        c.execute("DELETE FROM orders WHERE id=?", (order_id,))
+        cur.execute("DELETE FROM orders WHERE id=%s", (order_id,))
         conn.commit()
+        cur.close()
         conn.close()
 
         if owner_id is not None:
@@ -401,13 +513,12 @@ def delete_order(order_id):
 @login_required(role="ADMIN", api=True)
 def clear_orders():
     try:
-        conn = sqlite3.connect("laundry.db")
-        c = conn.cursor()
-        c.execute("DELETE FROM orders")
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM orders")
         conn.commit()
+        cur.close()
         conn.close()
-        # Broadcast to everyone (admins and customers alike) since this wipes
-        # every order in the system, not just one person's.
         socketio.emit("orders_cleared", {})
         return jsonify({"success": True, "message": "All orders cleared"})
     except Exception as e:
@@ -418,10 +529,11 @@ def clear_orders():
 @login_required(role="ADMIN", api=True)
 def delete_user(user_id):
     try:
-        conn = sqlite3.connect("laundry.db")
-        c = conn.cursor()
-        c.execute("DELETE FROM users WHERE id=?", (user_id,))
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM users WHERE id=%s", (user_id,))
         conn.commit()
+        cur.close()
         conn.close()
 
         socketio.emit("user_deleted", {"id": user_id})
@@ -438,38 +550,58 @@ def delete_user(user_id):
 @app.route('/stk_push', methods=['POST'])
 @login_required(api=True)
 def stk_push():
-    """Called from the 'Pay now' button on the orders page. Starts an
-    M-Pesa STK push and returns immediately — the pass/fail result arrives
-    later via the /mpesa/callback route -> 'payment_status' socket event."""
-    if not all([MPESA_CONSUMER_KEY, MPESA_CONSUMER_SECRET, MPESA_SHORTCODE,
-                MPESA_PASSKEY, MPESA_CALLBACK_URL]):
-        return jsonify({"success": False, "message": "M-Pesa is not configured on the server"}), 500
+    """Called from the 'Pay now' button. The client sends only order_id —
+    phone and amount are read from the order row itself."""
+    missing = [
+        name for name, value in {
+            "MPESA_CONSUMER_KEY": MPESA_CONSUMER_KEY,
+            "MPESA_CONSUMER_SECRET": MPESA_CONSUMER_SECRET,
+            "MPESA_SHORTCODE": MPESA_SHORTCODE,
+            "MPESA_PASSKEY": MPESA_PASSKEY,
+            "MPESA_CALLBACK_URL": MPESA_CALLBACK_URL,
+        }.items() if not value
+    ]
+    if missing:
+        return jsonify({
+            "success": False,
+            "message": f"M-Pesa is not configured: missing {', '.join(missing)} in your .env file"
+        }), 500
 
     data = request.get_json() or {}
     order_id = data.get("order_id")
-    phone = normalize_phone(data.get("phone", ""))
-    try:
-        amount = int(data.get("amount", 0))
-    except (TypeError, ValueError):
-        amount = 0
-
-    if not order_id or not phone or amount <= 0:
-        return jsonify({"success": False, "message": "Missing order_id, phone or amount"}), 400
+    if not order_id:
+        return jsonify({"success": False, "message": "Missing order_id"}), 400
 
     conn = get_db()
-    order = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+    cur = dict_cursor(conn)
+    cur.execute("SELECT * FROM orders WHERE id=%s", (order_id,))
+    order = cur.fetchone()
     if not order:
+        cur.close()
         conn.close()
         return jsonify({"success": False, "message": "Order not found"}), 404
 
-    # Customers may only pay for their own orders; admins can pay for any.
     if session.get('role') != 'ADMIN' and order['user_id'] != session['user_id']:
+        cur.close()
         conn.close()
         return jsonify({"success": False, "message": "Not authorized"}), 403
+
+    if order['status'] != 'Completed' or not order['amount']:
+        cur.close()
+        conn.close()
+        return jsonify({"success": False, "message": "This order has no amount to pay yet"}), 400
+
+    phone = normalize_phone(order['phone'])
+    amount = int(order['amount'])
+
+    cur.execute("UPDATE orders SET payment_status='pending' WHERE id=%s", (order_id,))
+    log_payment(conn, order_id, 'mpesa', amount, 'pending')
+    conn.commit()
 
     try:
         token = mpesa_access_token()
     except requests.RequestException:
+        cur.close()
         conn.close()
         return jsonify({"success": False, "message": "Could not reach M-Pesa. Try again."}), 502
 
@@ -479,7 +611,7 @@ def stk_push():
         "BusinessShortCode": MPESA_SHORTCODE,
         "Password": password,
         "Timestamp": timestamp,
-        "TransactionType": "CustomerPayBillOnline",  # use CustomerBuyGoodsOnline for a Till number
+        "TransactionType": "CustomerPayBillOnline",
         "Amount": amount,
         "PartyA": phone,
         "PartyB": MPESA_SHORTCODE,
@@ -498,18 +630,21 @@ def stk_push():
         )
         result = r.json()
     except requests.RequestException:
+        cur.close()
         conn.close()
         return jsonify({"success": False, "message": "Could not reach M-Pesa. Try again."}), 502
 
     if result.get("ResponseCode") == "0":
-        conn.execute(
-            "UPDATE orders SET checkout_request_id=?, amount=?, payment_method='mpesa' WHERE id=?",
-            (result["CheckoutRequestID"], amount, order_id)
+        cur.execute(
+            "UPDATE orders SET checkout_request_id=%s, payment_method='mpesa' WHERE id=%s",
+            (result["CheckoutRequestID"], order_id)
         )
         conn.commit()
+        cur.close()
         conn.close()
         return jsonify({"success": True, "message": "Prompt sent"})
 
+    cur.close()
     conn.close()
     return jsonify({
         "success": False,
@@ -517,53 +652,95 @@ def stk_push():
     }), 400
 
 
-@app.route('/mpesa/callback', methods=['POST'])
-def mpesa_callback():
-    """Safaricom POSTs the final result here once the customer responds to
-    the prompt (enters PIN, cancels, or it times out). This URL must be the
-    same public HTTPS URL set as MPESA_CALLBACK_URL above — no login here,
-    Safaricom's servers are the caller, not a browser with a session."""
-    body = request.get_json(force=True, silent=True) or {}
+@app.route("/callback", methods=["POST"])
+def callback():
     try:
-        stk = body["Body"]["stkCallback"]
-    except KeyError:
-        return jsonify({"ResultCode": 1, "ResultDesc": "Invalid payload"}), 400
+        data = request.get_json()
 
-    checkout_id = stk.get("CheckoutRequestID")
-    result_code = stk.get("ResultCode")
+        print("=" * 60)
+        print("CALLBACK RECEIVED")
+        print(data)
+        print("=" * 60)
 
-    conn = get_db()
-    order = conn.execute(
-        "SELECT * FROM orders WHERE checkout_request_id=?", (checkout_id,)
-    ).fetchone()
+        callback_data = data["Body"]["stkCallback"]
+        checkout_request_id = callback_data["CheckoutRequestID"]
+        result_code = int(callback_data["ResultCode"])
+        result_desc = callback_data["ResultDesc"]
 
-    if order:
-        order_id = order['id']
-        owner_id = order['user_id']
+        conn = get_db()
+        cur = dict_cursor(conn)
+        cur.execute(
+            "SELECT id, user_id, amount FROM orders WHERE checkout_request_id=%s",
+            (checkout_request_id,)
+        )
+        order = cur.fetchone()
 
+        if not order:
+            cur.close()
+            conn.close()
+            print(f"No order found for checkout id {checkout_request_id}")
+            return jsonify({"ResultCode": 0, "ResultDesc": "Accepted"})
+
+        order_id = order["id"]
+        user_id = order["user_id"]
+
+        # ====================================
+        # SUCCESSFUL PAYMENT
+        # ====================================
         if result_code == 0:
-            conn.execute("UPDATE orders SET payment_status='paid' WHERE id=?", (order_id,))
+            receipt = ""
+            metadata = callback_data.get("CallbackMetadata", {}).get("Item", [])
+            for item in metadata:
+                if item.get("Name") == "MpesaReceiptNumber":
+                    receipt = item.get("Value")
+                # Amount is intentionally NOT taken from here — it was
+                # already fixed by the admin's kg entry at complete time.
+
+            cur.execute(
+                "UPDATE orders SET payment_status='paid', mpesa_receipt=%s WHERE id=%s",
+                (receipt, order_id)
+            )
+            log_payment(conn, order_id, 'mpesa', order['amount'], 'paid', receipt)
             conn.commit()
-            payload = {"order_id": order_id, "status": "paid"}
+            cur.close()
+            conn.close()
+
+            print(f"PAYMENT SUCCESS Order #{order_id} Receipt={receipt}")
+
+            payload = {"order_id": order_id, "status": "paid", "receipt": receipt}
+            socketio.emit("payment_status", payload, room=str(user_id))
+            socketio.emit("payment_status", payload, room="admins")
+
+        # ====================================
+        # FAILED PAYMENT
+        # ====================================
         else:
-            # e.g. ResultCode 1032 = user cancelled, 1037 = timeout
-            conn.execute("UPDATE orders SET payment_status='failed' WHERE id=?", (order_id,))
+            cur.execute("UPDATE orders SET payment_status='failed' WHERE id=%s", (order_id,))
+            log_payment(conn, order_id, 'mpesa', order['amount'], 'failed')
             conn.commit()
-            payload = {"order_id": order_id, "status": "failed", "reason": stk.get("ResultDesc")}
+            cur.close()
+            conn.close()
 
-        if owner_id is not None:
-            socketio.emit("payment_status", payload, room=str(owner_id))
-        socketio.emit("payment_status", payload, room="admins")
+            print(f"PAYMENT FAILED Order #{order_id}: {result_desc}")
 
-    conn.close()
-    # Safaricom just needs a 200 with this shape to consider it handled.
-    return jsonify({"ResultCode": 0, "ResultDesc": "Accepted"})
+            payload = {"order_id": order_id, "status": "failed", "reason": result_desc}
+            socketio.emit("payment_status", payload, room=str(user_id))
+            socketio.emit("payment_status", payload, room="admins")
+
+        return jsonify({"ResultCode": 0, "ResultDesc": "Accepted"})
+
+    except Exception as e:
+        print("CALLBACK ERROR")
+        print(str(e))
+        return jsonify({"ResultCode": 0, "ResultDesc": "Accepted"})
 
 
 @app.route('/payment_method', methods=['POST'])
 @login_required(api=True)
 def payment_method():
-    """Called from the 'Pay after delivery' button."""
+    """Called from the 'Pay after delivery' button. Persists its own
+    payment_status ('cod') — see /mark_paid below for how this later
+    becomes 'paid' once cash is actually collected."""
     data = request.get_json() or {}
     order_id = data.get("order_id")
     method = data.get("method")
@@ -572,18 +749,73 @@ def payment_method():
         return jsonify({"success": False, "message": "Missing order_id or method"}), 400
 
     conn = get_db()
-    order = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+    cur = dict_cursor(conn)
+    cur.execute("SELECT * FROM orders WHERE id=%s", (order_id,))
+    order = cur.fetchone()
     if not order:
+        cur.close()
         conn.close()
         return jsonify({"success": False, "message": "Order not found"}), 404
 
     if session.get('role') != 'ADMIN' and order['user_id'] != session['user_id']:
+        cur.close()
         conn.close()
         return jsonify({"success": False, "message": "Not authorized"}), 403
 
-    conn.execute("UPDATE orders SET payment_method=? WHERE id=?", (method, order_id))
+    cur.execute(
+        "UPDATE orders SET payment_method=%s, payment_status='cod' WHERE id=%s",
+        (method, order_id)
+    )
+    log_payment(conn, order_id, method, order['amount'] or 0, 'cod')
     conn.commit()
+    owner_id = order['user_id']
+    cur.close()
     conn.close()
+
+    payload = {"order_id": order_id, "status": "cod"}
+    if owner_id is not None:
+        socketio.emit("payment_status", payload, room=str(owner_id))
+    socketio.emit("payment_status", payload, room="admins")
+
+    return jsonify({"success": True})
+
+
+@app.route('/mark_paid/<int:order_id>', methods=['POST'])
+@login_required(role="ADMIN", api=True)
+def mark_paid(order_id):
+    """Settles a cod (or otherwise unpaid) order once payment is actually
+    collected — e.g. cash handed over at delivery. This is what turns
+    'Pay on delivery' into 'Paid' instead of it staying that way forever."""
+    conn = get_db()
+    cur = dict_cursor(conn)
+    cur.execute("SELECT * FROM orders WHERE id=%s", (order_id,))
+    order = cur.fetchone()
+    if not order:
+        cur.close()
+        conn.close()
+        return jsonify({"success": False, "message": "Order not found"}), 404
+
+    if order['payment_status'] == 'paid':
+        cur.close()
+        conn.close()
+        return jsonify({"success": False, "message": "Already marked paid"}), 400
+
+    amount = order['amount'] or 0
+
+    cur.execute(
+        "UPDATE orders SET payment_status='paid', payment_method='cash' WHERE id=%s",
+        (order_id,)
+    )
+    log_payment(conn, order_id, 'cash', amount, 'paid')
+    conn.commit()
+    owner_id = order['user_id']
+    cur.close()
+    conn.close()
+
+    payload = {"order_id": order_id, "status": "paid"}
+    if owner_id is not None:
+        socketio.emit("payment_status", payload, room=str(owner_id))
+    socketio.emit("payment_status", payload, room="admins")
 
     return jsonify({"success": True})
 
