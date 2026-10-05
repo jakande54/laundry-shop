@@ -107,6 +107,66 @@ def mpesa_password_and_timestamp():
 
 
 # =====================================
+# SMS (AFRICA'S TALKING)
+# =====================================
+# Used to notify a customer their order is ready, over SMS — reaches them
+# whether or not they have the site open, or even have data/wifi at all,
+# unlike the socket.io live updates elsewhere in this app which only work
+# while they're actually looking at the page.
+#
+# Sign up at https://africastalking.com/, create an app, and you'll get a
+# username + API key. For testing without spending real SMS credit, use
+# the sandbox: username "sandbox", base URL
+# https://api.sandbox.africastalking.com/version1/messaging, and add your
+# own phone as a simulator number in the sandbox dashboard.
+AT_USERNAME = os.environ.get("AT_USERNAME", "")
+AT_API_KEY = os.environ.get("AT_API_KEY", "")
+AT_SENDER_ID = os.environ.get("AT_SENDER_ID", "")  # optional, needs approval
+AT_BASE_URL = os.environ.get(
+    "AT_BASE_URL", "https://api.africastalking.com/version1/messaging"
+)
+# The link put in the SMS telling the customer where to go pay.
+SITE_URL = os.environ.get("SITE_URL", "http://localhost:5001")
+
+
+def send_sms(phone, message):
+    """Sends one SMS via Africa's Talking. Deliberately never raises — a
+    failed SMS should never block marking an order complete, it should
+    just get logged so you can notice and retry manually if needed.
+    Returns True/False so the caller can report it back to the admin."""
+    if not AT_USERNAME or not AT_API_KEY:
+        print("SMS not sent: AT_USERNAME/AT_API_KEY not set in .env")
+        return False
+
+    try:
+        data = {
+            "username": AT_USERNAME,
+            "to": "+" + normalize_phone(phone),  # AT wants E.164 with the +
+            "message": message,
+        }
+        if AT_SENDER_ID:
+            data["from"] = AT_SENDER_ID
+
+        resp = requests.post(
+            AT_BASE_URL,
+            data=data,
+            headers={
+                "apiKey": AT_API_KEY,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        print(f"SMS to {phone}: {result}")
+        return True
+    except Exception as e:
+        print(f"Could not send SMS to {phone}: {e}")
+        return False
+
+
+# =====================================
 # DECORATOR (defined first, before use)
 # =====================================
 
@@ -145,6 +205,11 @@ def init_db():
     )
     """)
 
+    # Every customer's phone lives on their account now, captured once at
+    # registration, so /add_order can fill it in automatically instead of
+    # asking for name/phone on every single order.
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT")
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS orders(
         id SERIAL PRIMARY KEY,
@@ -168,10 +233,9 @@ def init_db():
     ):
         cur.execute(ddl)
 
-    # Payment history — a running log of every payment EVENT (an STK push
-    # started, succeeded, failed; cod chosen; cash settled later), separate
-    # from orders which only ever shows the CURRENT state. This is what
-    # actually lets you track payments, not just see where things stand now.
+    # Payment history — one row PER ORDER, kept up to date in place (see
+    # log_payment's ON CONFLICT below) rather than a new row every time
+    # something happens to that order's payment.
     cur.execute("""
     CREATE TABLE IF NOT EXISTS payments(
         id SERIAL PRIMARY KEY,
@@ -183,6 +247,50 @@ def init_db():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
+
+    # --- Fix "violates foreign key constraint" on delete ---
+    # The REFERENCES above create constraints with NO delete behavior
+    # specified, which defaults to blocking the delete entirely. Recreate
+    # both with ON DELETE CASCADE: deleting an order removes its payment
+    # row with it; deleting a user removes their orders (and, by the same
+    # cascade, those orders' payment rows) with them.
+    try:
+        cur.execute("ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_user_id_fkey")
+        cur.execute(
+            "ALTER TABLE orders ADD CONSTRAINT orders_user_id_fkey "
+            "FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE"
+        )
+        cur.execute("ALTER TABLE payments DROP CONSTRAINT IF EXISTS payments_order_id_fkey")
+        cur.execute(
+            "ALTER TABLE payments ADD CONSTRAINT payments_order_id_fkey "
+            "FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE"
+        )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"Could not update foreign key constraints: {e}")
+
+    # --- Collapse any existing multi-row history down to one row per order ---
+    # Older runs logged a new row per event (pending, paid, cod, ...), so an
+    # order could have several rows by now. Keep only the most recent one
+    # before the UNIQUE constraint below is added, or that constraint will
+    # fail on the leftover duplicates.
+    try:
+        cur.execute("""
+            DELETE FROM payments p1
+            USING payments p2
+            WHERE p1.order_id = p2.order_id
+              AND p1.id < p2.id
+        """)
+        cur.execute(
+            "ALTER TABLE payments ADD CONSTRAINT payments_order_id_key UNIQUE (order_id)"
+        )
+        conn.commit()
+    except psycopg2.errors.DuplicateObject:
+        conn.rollback()  # constraint already exists from a previous run — fine
+    except Exception as e:
+        conn.rollback()
+        print(f"Could not add unique constraint on payments.order_id: {e}")
 
     cur.execute(
         """
@@ -199,11 +307,24 @@ def init_db():
 
 
 def log_payment(conn, order_id, method, amount, status, reference=None):
-    """Appends one row to the payments log. Doesn't commit — the caller
-    commits alongside its own orders UPDATE so both happen atomically."""
+    """Keeps ONE row per order_id up to date — inserts it the first time,
+    and updates method/amount/status/reference/created_at in place on every
+    later call for the same order (a retry, a status change, a cash
+    settlement), instead of accumulating a new row per event. Doesn't
+    commit — the caller commits alongside its own orders UPDATE so both
+    happen atomically."""
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO payments(order_id, method, amount, status, reference) VALUES (%s, %s, %s, %s, %s)",
+        """
+        INSERT INTO payments(order_id, method, amount, status, reference)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (order_id) DO UPDATE SET
+            method = EXCLUDED.method,
+            amount = EXCLUDED.amount,
+            status = EXCLUDED.status,
+            reference = EXCLUDED.reference,
+            created_at = CURRENT_TIMESTAMP
+        """,
         (order_id, method, amount, status, reference)
     )
     cur.close()
@@ -237,6 +358,7 @@ def login():
             session['user_id'] = user['id']
             session['fullname'] = user['fullname']
             session['role'] = user['role']
+            session['phone'] = user['phone']
             return jsonify({"success": True, "role": user['role']})
 
         return jsonify({"success": False, "message": "Invalid username or password"})
@@ -252,9 +374,10 @@ def register():
         fullname = data.get('fullname')
         username = data.get('username')
         password = data.get('password')
+        phone = data.get('phone')
         role = data.get('role', 'CUSTOMER')
 
-        if not fullname or not username or not password:
+        if not fullname or not username or not password or not phone:
             return jsonify({"success": False, "message": "Missing required fields"})
 
         conn = get_db()
@@ -262,8 +385,8 @@ def register():
         try:
             hashed_password = generate_password_hash(password)
             cur.execute(
-                "INSERT INTO users (fullname, username, password, role) VALUES (%s, %s, %s, %s) RETURNING id",
-                (fullname, username, hashed_password, role)
+                "INSERT INTO users (fullname, username, password, role, phone) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                (fullname, username, hashed_password, role, phone)
             )
             new_user_id = cur.fetchone()[0]
             conn.commit()
@@ -401,10 +524,16 @@ def orders_data():
 @login_required(api=True)
 def add_order():
     try:
-        data = request.get_json()
-        customer = data["customer"]
-        phone = data["phone"]
-        service = data["service"]
+        data = request.get_json() or {}
+        service = data.get("service")
+        if not service:
+            return jsonify({"success": False, "message": "Missing service"})
+
+        # Name and phone come from the account, not the request — the
+        # customer already gave these once at registration, so they never
+        # have to retype them for every order.
+        customer = session.get('fullname')
+        phone = session.get('phone')
 
         conn = get_db()
         cur = conn.cursor()
@@ -470,6 +599,12 @@ def complete_order(order_id):
     cur.close()
     conn.close()
 
+    sms_sent = send_sms(
+        row["phone"],
+        f"Hi {row['customer']}, your laundry order #{order_id} is ready for "
+        f"pickup! Amount due: KES {amount}. Pay now at {SITE_URL}/customer"
+    )
+
     payload = {
         "id": order_id,
         "customer": row["customer"],
@@ -482,7 +617,7 @@ def complete_order(order_id):
         socketio.emit("order_completed", payload, room=str(row["user_id"]))
     socketio.emit("order_completed", payload, room="admins")
 
-    return jsonify({"success": True, "kg": kg, "amount": amount})
+    return jsonify({"success": True, "kg": kg, "amount": amount, "sms_sent": sms_sent})
 
 
 @app.route('/delete/<int:order_id>', methods=['DELETE'])
@@ -598,6 +733,19 @@ def stk_push():
     log_payment(conn, order_id, 'mpesa', amount, 'pending')
     conn.commit()
 
+    pending_payload = {
+        "order_id": order_id,
+        "customer": order['customer'],
+        "method": "mpesa",
+        "amount": amount,
+        "status": "pending",
+        "reference": None,
+        "created_at": datetime.now().isoformat(),
+    }
+    if order['user_id'] is not None:
+        socketio.emit("payment_status", pending_payload, room=str(order['user_id']))
+    socketio.emit("payment_status", pending_payload, room="admins")
+
     try:
         token = mpesa_access_token()
     except requests.RequestException:
@@ -670,7 +818,7 @@ def callback():
         conn = get_db()
         cur = dict_cursor(conn)
         cur.execute(
-            "SELECT id, user_id, amount FROM orders WHERE checkout_request_id=%s",
+            "SELECT id, user_id, customer, amount FROM orders WHERE checkout_request_id=%s",
             (checkout_request_id,)
         )
         order = cur.fetchone()
@@ -707,7 +855,15 @@ def callback():
 
             print(f"PAYMENT SUCCESS Order #{order_id} Receipt={receipt}")
 
-            payload = {"order_id": order_id, "status": "paid", "receipt": receipt}
+            payload = {
+                "order_id": order_id,
+                "customer": order['customer'],
+                "method": "mpesa",
+                "amount": order['amount'],
+                "status": "paid",
+                "reference": receipt,
+                "created_at": datetime.now().isoformat(),
+            }
             socketio.emit("payment_status", payload, room=str(user_id))
             socketio.emit("payment_status", payload, room="admins")
 
@@ -723,7 +879,16 @@ def callback():
 
             print(f"PAYMENT FAILED Order #{order_id}: {result_desc}")
 
-            payload = {"order_id": order_id, "status": "failed", "reason": result_desc}
+            payload = {
+                "order_id": order_id,
+                "customer": order['customer'],
+                "method": "mpesa",
+                "amount": order['amount'],
+                "status": "failed",
+                "reference": None,
+                "reason": result_desc,
+                "created_at": datetime.now().isoformat(),
+            }
             socketio.emit("payment_status", payload, room=str(user_id))
             socketio.emit("payment_status", payload, room="admins")
 
@@ -772,7 +937,15 @@ def payment_method():
     cur.close()
     conn.close()
 
-    payload = {"order_id": order_id, "status": "cod"}
+    payload = {
+        "order_id": order_id,
+        "customer": order['customer'],
+        "method": method,
+        "amount": order['amount'] or 0,
+        "status": "cod",
+        "reference": None,
+        "created_at": datetime.now().isoformat(),
+    }
     if owner_id is not None:
         socketio.emit("payment_status", payload, room=str(owner_id))
     socketio.emit("payment_status", payload, room="admins")
@@ -812,7 +985,15 @@ def mark_paid(order_id):
     cur.close()
     conn.close()
 
-    payload = {"order_id": order_id, "status": "paid"}
+    payload = {
+        "order_id": order_id,
+        "customer": order['customer'],
+        "method": "cash",
+        "amount": amount,
+        "status": "paid",
+        "reference": None,
+        "created_at": datetime.now().isoformat(),
+    }
     if owner_id is not None:
         socketio.emit("payment_status", payload, room=str(owner_id))
     socketio.emit("payment_status", payload, room="admins")

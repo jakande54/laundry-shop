@@ -393,6 +393,18 @@
         display: flex;
       }
 
+      .stk-status.error {
+        background: #fef2f2;
+        border-color: #fecaca;
+        color: var(--red);
+      }
+
+      .stk-status.success {
+        background: #f0fdf4;
+        border-color: #bbf7d0;
+        color: var(--green);
+      }
+
       .spinner {
         width: 16px;
         height: 16px;
@@ -580,14 +592,10 @@
     <div class="modal-overlay" id="orderModal">
       <div class="modal">
         <h2 class="modal-title">New Order</h2>
-        <div class="form-group">
-          <label>Your name</label>
-          <input id="oName" type="text" placeholder="Jane Doe" />
-        </div>
-        <div class="form-group">
-          <label>Phone number</label>
-          <input id="oPhone" type="tel" placeholder="+254 700 000 000" />
-        </div>
+        <p class="modal-subtitle">
+          Placing this order as {{ fullname }}. Just pick a service — your name
+          and phone are already on your account.
+        </p>
         <div class="form-group">
           <label>Service</label>
           <select id="oService">
@@ -654,7 +662,7 @@
         </div>
 
         <div class="stk-status" id="stkStatus">
-          <div class="spinner"></div>
+          <div class="spinner" id="stkSpinner"></div>
           <span id="stkStatusText"
             >Waiting for the customer to enter their M-Pesa PIN…</span
           >
@@ -673,6 +681,31 @@
     <script>
       const socket = io();
       let currentPaymentOrder = null; // { id, customer, phone, kg, amount }
+      let stkTimeoutId = null;
+
+      // One place that controls the whole waiting/success/error box, so
+      // every state (sending, waiting, paid, failed, timed out) looks and
+      // behaves consistently instead of the box just staying stuck on
+      // "waiting" forever with nothing to fall back to.
+      function setStkStatus(kind, text) {
+        const box = document.getElementById("stkStatus");
+        const spinner = document.getElementById("stkSpinner");
+        box.classList.remove("error", "success");
+        box.classList.add("show");
+        if (kind === "loading") {
+          spinner.style.display = "";
+        } else {
+          spinner.style.display = "none";
+          box.classList.add(kind); // "error" or "success"
+        }
+        document.getElementById("stkStatusText").textContent = text;
+      }
+
+      function hideStkStatus() {
+        document
+          .getElementById("stkStatus")
+          .classList.remove("show", "error", "success");
+      }
 
       function showToast(msg, ok = true) {
         const t = document.getElementById("toast");
@@ -691,8 +724,6 @@
       });
 
       function clearOrderForm() {
-        document.getElementById("oName").value = "";
-        document.getElementById("oPhone").value = "";
         document.getElementById("oService").selectedIndex = 0;
       }
 
@@ -795,22 +826,29 @@
       });
 
       // Fired by the server after the STK push resolves via the M-Pesa
-      // callback.
+      // callback — or if the customer cancels the prompt on their phone,
+      // which comes back as a "failed" status with a human-readable reason
+      // (e.g. "Request cancelled by user").
       socket.on("payment_status", ({ order_id, status, reason }) => {
         if (currentPaymentOrder && currentPaymentOrder.id === order_id) {
-          const statusBox = document.getElementById("stkStatus");
-          const statusText = document.getElementById("stkStatusText");
+          clearTimeout(stkTimeoutId);
           if (status === "paid") {
-            statusBox.classList.add("show");
-            statusText.textContent = "Payment received. Thank you!";
+            setStkStatus("success", "Payment received. Thank you!");
             showToast("Payment received");
             markRowPaid(order_id);
-            setTimeout(closePaymentModal, 1500);
+            setTimeout(closePaymentModal, 1800);
           } else if (status === "failed") {
-            statusBox.classList.remove("show");
+            setStkStatus(
+              "error",
+              reason
+                ? `Payment not completed: ${reason}`
+                : "Payment was not completed. You can try again below.",
+            );
             showToast(reason || "Payment was not completed", false);
             setPayOptionsDisabled(false);
           }
+          // "pending" is already reflected by the loading state set the
+          // moment the prompt was sent — nothing extra to show here.
         } else if (status === "paid") {
           markRowPaid(order_id);
         } else if (status === "cod") {
@@ -844,13 +882,15 @@
         document.getElementById("payAmount").textContent = amount
           ? `KES ${amount}`
           : "KES –";
-        document.getElementById("stkStatus").classList.remove("show");
+        clearTimeout(stkTimeoutId);
+        hideStkStatus();
         setPayOptionsDisabled(false);
         document.getElementById("paymentModal").classList.add("open");
       }
 
       function closePaymentModal() {
         document.getElementById("paymentModal").classList.remove("open");
+        clearTimeout(stkTimeoutId);
         currentPaymentOrder = null;
       }
 
@@ -867,10 +907,7 @@
         if (!currentPaymentOrder) return;
 
         setPayOptionsDisabled(true);
-        const statusBox = document.getElementById("stkStatus");
-        const statusText = document.getElementById("stkStatusText");
-        statusBox.classList.add("show");
-        statusText.textContent = "Sending the payment prompt…";
+        setStkStatus("loading", "Sending the payment prompt…");
 
         try {
           // Only order_id goes to the server now — it looks up phone and
@@ -883,20 +920,34 @@
           const data = await res.json();
 
           if (data.success) {
-            statusText.textContent =
-              "Prompt sent. Ask the customer to check their phone and enter their M-Pesa PIN.";
+            setStkStatus(
+              "loading",
+              "Prompt sent. Check your phone and enter your M-Pesa PIN within 60 seconds.",
+            );
+
+            // Safaricom's STK prompt itself expires after about 60 seconds.
+            // Without this, if the "payment_status" event never arrives —
+            // callback URL unreachable, phone off, request just dropped —
+            // this box would spin forever with no way back to the buttons.
+            clearTimeout(stkTimeoutId);
+            stkTimeoutId = setTimeout(() => {
+              if (!currentPaymentOrder) return;
+              setStkStatus(
+                "error",
+                "No response yet. If you completed the prompt, wait a moment and check again — otherwise tap Pay now to retry.",
+              );
+              setPayOptionsDisabled(false);
+            }, 60000);
           } else {
-            statusBox.classList.remove("show");
-            showToast(
+            setStkStatus(
+              "error",
               data.message || "Could not send the payment prompt",
-              false,
             );
             setPayOptionsDisabled(false);
           }
         } catch (error) {
           console.error(error);
-          statusBox.classList.remove("show");
-          showToast("Server error. Please try again.", false);
+          setStkStatus("error", "Server error. Please try again.");
           setPayOptionsDisabled(false);
         }
       }
@@ -932,14 +983,7 @@
       }
 
       async function submitOrder() {
-        const customer = document.getElementById("oName").value.trim();
-        const phone = document.getElementById("oPhone").value.trim();
         const service = document.getElementById("oService").value;
-
-        if (!customer || !phone) {
-          showToast("Please fill in all fields", false);
-          return;
-        }
 
         const placeBtn = document.getElementById("placeOrderBtn");
         placeBtn.disabled = true;
@@ -949,7 +993,7 @@
           const res = await fetch("/add_order", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ customer, phone, service }),
+            body: JSON.stringify({ service }),
           });
           const data = await res.json();
 

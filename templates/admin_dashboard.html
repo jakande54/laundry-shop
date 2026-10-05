@@ -514,10 +514,14 @@
       <h2 style="font-size: 1rem; font-weight: 600; margin: 2rem 0 1rem">
         Payment History
       </h2>
-      <div class="card" style="padding: 0; overflow: hidden">
+      <div
+        class="card"
+        id="paymentHistoryCard"
+        style="padding: 0; overflow: hidden"
+      >
         {% if payments %}
         <div class="table-wrap" style="border: none; border-radius: 0">
-          <table>
+          <table id="paymentHistoryTable">
             <thead>
               <tr>
                 <th>Order #</th>
@@ -529,9 +533,9 @@
                 <th>When</th>
               </tr>
             </thead>
-            <tbody>
+            <tbody id="paymentHistoryBody">
               {% for p in payments %}
-              <tr>
+              <tr id="payment-history-{{ p.order_id }}">
                 <td style="color: var(--muted); font-size: 0.8rem">
                   #{{ p.order_id }}
                 </td>
@@ -557,7 +561,7 @@
           </table>
         </div>
         {% else %}
-        <div class="empty-state">
+        <div class="empty-state" id="paymentHistoryEmptyState">
           <div style="font-weight: 600">No payment activity yet</div>
         </div>
         {% endif %}
@@ -718,7 +722,14 @@
           const data = await res.json();
 
           if (data.success) {
-            showToast(`Order marked complete — KES ${data.amount}`);
+            if (data.sms_sent) {
+              showToast(`Order marked complete — KES ${data.amount}`);
+            } else {
+              showToast(
+                `Order marked complete — KES ${data.amount}, but the SMS could not be sent`,
+                false,
+              );
+            }
             const row = document.getElementById(`row-${id}`);
             if (row) {
               const badge = row.querySelector(".badge");
@@ -849,6 +860,24 @@
           showOrdersEmptyState();
         }
         updateOrderStats();
+
+        // Deleting the order cascades to delete its payment record too —
+        // drop the matching history row here so this dashboard reflects
+        // that immediately.
+        const historyRow = document.getElementById(`payment-history-${id}`);
+        if (historyRow) {
+          historyRow.remove();
+          if (!document.querySelector("#paymentHistoryTable tbody tr")) {
+            const paymentCard = document.getElementById("paymentHistoryCard");
+            if (paymentCard) {
+              paymentCard.innerHTML = `
+                <div class="empty-state" id="paymentHistoryEmptyState">
+                  <div style="font-weight: 600">No payment activity yet</div>
+                </div>
+              `;
+            }
+          }
+        }
       });
 
       socket.on("orders_cleared", () => {
@@ -856,6 +885,19 @@
         document.getElementById("totalCount").textContent = "0";
         document.getElementById("pendingCount").textContent = "0";
         document.getElementById("completedCount").textContent = "0";
+
+        // Clearing all orders cascades to delete every payment record in
+        // the database too (see the ON DELETE CASCADE on payments.order_id)
+        // — this just makes the page reflect that immediately instead of
+        // showing stale rows until refreshed.
+        const paymentCard = document.getElementById("paymentHistoryCard");
+        if (paymentCard) {
+          paymentCard.innerHTML = `
+            <div class="empty-state" id="paymentHistoryEmptyState">
+              <div style="font-weight: 600">No payment activity yet</div>
+            </div>
+          `;
+        }
       });
 
       socket.on("user_deleted", ({ id }) => {
@@ -863,38 +905,125 @@
         if (row) row.remove();
       });
 
+      function ensurePaymentHistoryTableExists() {
+        if (document.getElementById("paymentHistoryTable")) return;
+        const card = document.getElementById("paymentHistoryCard");
+        card.innerHTML = `
+          <div class="table-wrap" style="border: none; border-radius: 0">
+            <table id="paymentHistoryTable">
+              <thead>
+                <tr>
+                  <th>Order #</th>
+                  <th>Customer</th>
+                  <th>Method</th>
+                  <th>Amount</th>
+                  <th>Status</th>
+                  <th>Reference</th>
+                  <th>When</th>
+                </tr>
+              </thead>
+              <tbody id="paymentHistoryBody"></tbody>
+            </table>
+          </div>
+        `;
+      }
+
+      function paymentBadgeClass(status) {
+        if (status === "paid") return "badge-paid";
+        if (status === "cod") return "badge-cod";
+        if (status === "failed") return "badge-unpaid";
+        return "badge-pending"; // pending
+      }
+
+      // Inserts a new Payment History row for this order, or updates the
+      // existing one in place — matches how the server's log_payment()
+      // now keeps one row per order rather than appending a new one each
+      // time the status changes.
+      function upsertPaymentHistoryRow(p) {
+        ensurePaymentHistoryTableExists();
+
+        const amountText = p.amount ? `KES ${p.amount}` : "–";
+        const referenceText = p.reference || "–";
+        const whenText = p.created_at
+          ? new Date(p.created_at).toLocaleString()
+          : "";
+        const badgeClass = paymentBadgeClass(p.status);
+
+        const existingRow = document.getElementById(
+          `payment-history-${p.order_id}`,
+        );
+
+        if (existingRow) {
+          const cells = existingRow.querySelectorAll("td");
+          cells[2].textContent = p.method || "";
+          cells[3].textContent = amountText;
+          const badge = cells[4].querySelector(".badge");
+          badge.className = `badge ${badgeClass}`;
+          badge.textContent = p.status;
+          cells[5].textContent = referenceText;
+          cells[6].textContent = whenText;
+          return;
+        }
+
+        const tbody = document.getElementById("paymentHistoryBody");
+        if (!tbody) return;
+        tbody.insertAdjacentHTML(
+          "afterbegin",
+          `
+          <tr id="payment-history-${p.order_id}">
+            <td style="color: var(--muted); font-size: 0.8rem">#${p.order_id}</td>
+            <td>${p.customer || "–"}</td>
+            <td>${p.method || ""}</td>
+            <td>${amountText}</td>
+            <td><span class="badge ${badgeClass}">${p.status}</span></td>
+            <td style="font-size: 0.8rem; color: var(--muted)">${referenceText}</td>
+            <td style="font-size: 0.8rem; color: var(--muted)">${whenText}</td>
+          </tr>
+        `,
+        );
+      }
+
       // Fired once M-Pesa resolves an STK push, or the customer picks
       // "pay after delivery" — updates the Payment badge live AND keeps the
       // Mark Paid button in sync (previously this only updated the badge
       // text/color, so a live "cod" event never added the button — it only
       // ever showed up after a page refresh, which re-ran the Jinja check).
-      socket.on("payment_status", ({ order_id, status }) => {
+      // Also now keeps the Payment History table in sync live, the same
+      // way — previously that table only ever rendered once on page load.
+      socket.on("payment_status", (p) => {
+        const { order_id, status } = p;
         const badge = document.getElementById(`payment-${order_id}`);
-        if (!badge) return;
-        const wrapper = badge.parentElement;
-        const existingBtn = wrapper
-          ? wrapper.querySelector(".btn-mark-paid")
-          : null;
+        if (badge) {
+          const wrapper = badge.parentElement;
+          const existingBtn = wrapper
+            ? wrapper.querySelector(".btn-mark-paid")
+            : null;
 
-        if (status === "paid") {
-          badge.className = "badge badge-paid";
-          badge.textContent = "paid";
-          if (existingBtn) existingBtn.remove();
-        } else if (status === "cod") {
-          badge.className = "badge badge-cod";
-          badge.textContent = "cod";
-          if (wrapper && !existingBtn) {
-            const btn = document.createElement("button");
-            btn.className = "btn btn-success btn-sm btn-mark-paid";
-            btn.dataset.id = order_id;
-            btn.textContent = "Mark Paid";
-            wrapper.appendChild(btn);
+          if (status === "paid") {
+            badge.className = "badge badge-paid";
+            badge.textContent = "paid";
+            if (existingBtn) existingBtn.remove();
+          } else if (status === "cod") {
+            badge.className = "badge badge-cod";
+            badge.textContent = "cod";
+            if (wrapper && !existingBtn) {
+              const btn = document.createElement("button");
+              btn.className = "btn btn-success btn-sm btn-mark-paid";
+              btn.dataset.id = order_id;
+              btn.textContent = "Mark Paid";
+              wrapper.appendChild(btn);
+            }
+          } else if (status === "failed") {
+            badge.className = "badge badge-unpaid";
+            badge.textContent = "unpaid";
+            if (existingBtn) existingBtn.remove();
           }
-        } else if (status === "failed") {
-          badge.className = "badge badge-unpaid";
-          badge.textContent = "unpaid";
-          if (existingBtn) existingBtn.remove();
+          // "pending" leaves the order's own Payment badge as-is (it's
+          // still "unpaid" until the push resolves) — only the history
+          // table below reflects the pending attempt.
         }
+
+        upsertPaymentHistoryRow(p);
       });
 
       // Fired right after a customer registers — adds them to the Users
