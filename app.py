@@ -45,7 +45,7 @@ app.config["TEMPLATES_AUTO_RELOAD"] = False
 #   export DATABASE_URL=postgresql://laundry_user:laundry_pass@localhost:5432/laundry_db
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
-    "postgresql://laundry_user:laundry_pass@localhost:5432/laundry_db",
+    "postgresql://postgres.obvvtyuavziykoeysnme:[Obadiah.1234$]@aws-0-us-east-1.pooler.supabase.com:6543/postgres",
 )
 
 
